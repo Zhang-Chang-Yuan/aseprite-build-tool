@@ -1,0 +1,347 @@
+# =============================================================================
+# Aseprite 自动构建与发布工作流
+#
+# 功能：
+#   1. workflow_dispatch 手动触发：可指定 Aseprite 版本 tag（留空构建最新稳定版）与平台。
+#   2. schedule 定时触发：每天 UTC 2:00 检查 aseprite/aseprite 官方新稳定 tag，
+#      与本仓库已有 Release（含草稿）对比，发现缺失版本则自动构建全部三个平台。
+#
+# 产物以 Draft Release（草稿）形式发布，仅仓库所有者/协作者可见，
+# 用于规避 Aseprite EULA 对公开分发的限制。
+# =============================================================================
+
+name: Build and Release Aseprite
+
+on:
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      aseprite_version:
+        description: 'Aseprite 版本 tag，如 v1.3.10.2，留空则构建最新稳定版'
+        required: false
+        default: ''
+        type: string
+      platform:
+        description: '构建平台'
+        required: false
+        type: choice
+        default: 'windows-latest'
+        options:
+          - windows-latest
+          - macos-latest
+          - ubuntu-latest
+  # 每天定时检查新版本
+  schedule:
+    # 每天 UTC 2:00（北京时间 10:00）
+    - cron: '0 2 * * *'
+
+# 同一并发组排队执行，不取消进行中的运行
+concurrency:
+  group: aseprite-build-and-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1：检查官方新版本（仅 schedule 事件运行）
+  # 对比 aseprite/aseprite 官方 tags 与本仓库已有 releases（含 draft），
+  # 输出缺失的稳定版本 JSON 数组。
+  # ---------------------------------------------------------------------------
+  check-and-trigger:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    outputs:
+      missing_versions: ${{ steps.check.outputs.missing_versions }}
+    steps:
+      - name: 检查 aseprite/aseprite 官方新版本
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # ---- 1. 获取本仓库已有 releases（含 draft），提取 tag 名集合 ----
+          local_tags_file="$(mktemp)"
+          page=1
+          while :; do
+            resp=$(curl -sSf \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}")
+            count=$(echo "$resp" | jq -r 'length')
+            if [ "$count" -eq 0 ]; then
+              break
+            fi
+            echo "$resp" | jq -r '.[].tag_name' >> "$local_tags_file"
+            page=$((page + 1))
+          done
+          # 去重排序
+          if [ -s "$local_tags_file" ]; then
+            sort -u "$local_tags_file" -o "$local_tags_file"
+          fi
+          echo "本仓库已有 releases（含 draft）："
+          cat "$local_tags_file" || true
+
+          # ---- 2. 获取 aseprite/aseprite 官方 tags（分页拉取）----
+          official_tags_file="$(mktemp)"
+          page=1
+          while :; do
+            resp=$(curl -sSf \
+              "https://api.github.com/repos/aseprite/aseprite/tags?per_page=100&page=${page}")
+            count=$(echo "$resp" | jq -r 'length')
+            if [ "$count" -eq 0 ]; then
+              break
+            fi
+            echo "$resp" | jq -r '.[].name' >> "$official_tags_file"
+            page=$((page + 1))
+            # 安全上限，防止无限翻页
+            if [ "$page" -gt 20 ]; then
+              break
+            fi
+          done
+          sort -u "$official_tags_file" -o "$official_tags_file"
+
+          # ---- 3. 过滤：只保留稳定版本 vX.Y.Z 或 vX.Y.Z.N（跳过 alpha/beta/rc/dev/SNAPSHOT 等）----
+          stable_file="$(mktemp)"
+          grep -E '^v[0-9]+(\.[0-9]+)+$' "$official_tags_file" > "$stable_file" || true
+          echo "官方稳定版本 tag："
+          cat "$stable_file" || true
+
+          # ---- 4. 对比找出缺失版本（按 tag 排序取最新在前，这里保留全部缺失）----
+          missing="$(comm -23 "$stable_file" "$local_tags_file" | sort -rV)"
+          echo "缺失版本："
+          echo "$missing" || true
+
+          # ---- 5. 输出为 JSON 数组，并设置 step output ----
+          json=$(echo "$missing" | jq -R . | jq -s -c .)
+          # 空输入时输出 []
+          if [ -z "$(echo "$missing" | tr -d '[:space:]')" ]; then
+            json="[]"
+          fi
+          echo "missing_versions=${json}" >> "$GITHUB_OUTPUT"
+          echo "最终输出：${json}"
+
+  # ---------------------------------------------------------------------------
+  # Job 2：构建矩阵
+  #  - workflow_dispatch：version 取输入（空则解析为 latest，再由构建步骤解析），
+  #    platform 取用户选择。
+  #  - schedule：version 取缺失版本数组，platform 为三个平台。
+  # ---------------------------------------------------------------------------
+  build:
+    needs: check-and-trigger
+    if: >-
+      always() &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'schedule' &&
+          needs.check-and-trigger.outputs.missing_versions != '' &&
+          needs.check-and-trigger.outputs.missing_versions != '[]'
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ github.event_name == 'workflow_dispatch'
+          && fromJSON(format('["{0}"]', inputs.aseprite_version))
+          || fromJSON(needs.check-and-trigger.outputs.missing_versions) }}
+        platform: ${{ github.event_name == 'workflow_dispatch'
+          && fromJSON(format('["{0}"]', inputs.platform))
+          || fromJSON('["windows-latest", "macos-latest", "ubuntu-latest"]') }}
+    runs-on: ${{ matrix.platform }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 解析要构建的版本号
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_VERSION}"
+          # 输入为空或 'latest' 时，通过 API 获取 aseprite/aseprite 最新 release 的 tag_name
+          if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
+            VERSION=$(curl -sSf https://api.github.com/repos/aseprite/aseprite/releases/latest \
+              | jq -r '.tag_name')
+            echo "输入为空/latest，使用官方最新 release：${VERSION}"
+          fi
+          # 仅支持稳定版本，拒绝 alpha/beta/rc/dev/SNAPSHOT 等预发布 tag
+          if ! echo "$VERSION" | grep -Eq '^v[0-9]+(\.[0-9]+)+$'; then
+            echo "不支持的版本格式：${VERSION}（仅支持 vX.Y.Z 或 vX.Y.Z.N 的稳定版本）"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "最终构建版本：${VERSION}"
+
+      # -----------------------------------------------------------------
+      # 安装依赖（三个平台 runner 自带 cmake；仅补充 ninja 与 Linux X11 头文件）
+      # -----------------------------------------------------------------
+      - name: 安装依赖
+        env:
+          RUNNER_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          case "$RUNNER_PLATFORM" in
+            windows-latest)
+              # windows-latest 自带 cmake，安装 ninja（若缺失）
+              cmake --version || true
+              ninja --version || choco install ninja -y --no-progress
+              ;;
+            macos-latest)
+              # macOS 自带 cmake，安装 ninja
+              cmake --version || true
+              brew install ninja
+              ;;
+            ubuntu-latest)
+              # Ubuntu：cmake 自带，安装 ninja 与 X11/OpenGL 开发头文件
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends \
+                ninja-build libx11-dev libxcursor-dev libxi-dev \
+                libxrandr-dev libgl1-mesa-dev libfontconfig1-dev
+              cmake --version
+              ninja --version
+              ;;
+            *)
+              echo "未知平台：${RUNNER_PLATFORM}"
+              exit 1
+              ;;
+          esac
+
+      # -----------------------------------------------------------------
+      # 克隆 Aseprite 源码（指定 tag，递归子模块，浅克隆）
+      # -----------------------------------------------------------------
+      - name: 克隆 Aseprite 源码
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone --recursive --branch "$VERSION" --depth 1 \
+            https://github.com/aseprite/aseprite.git
+
+      # -----------------------------------------------------------------
+      # 下载 Skia（aseprite/skia 官方预编译包，m124 分支）
+      # -----------------------------------------------------------------
+      - name: 下载 Skia
+        env:
+          RUNNER_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          # aseprite/skia 的 release tag 为 m124-08a5439a6b，资源名为 Skia-<平台>-Release-x64.zip
+          SKIA_TAG="m124-08a5439a6b"
+          case "$RUNNER_PLATFORM" in
+            windows-latest) SKIA_ZIP="Skia-Windows-Release-x64.zip" ;;
+            macos-latest)   SKIA_ZIP="Skia-macOS-Release-x64.zip" ;;
+            ubuntu-latest)  SKIA_ZIP="Skia-Linux-Release-x64.zip" ;;
+          esac
+          curl -sSfL -o "$SKIA_ZIP" \
+            "https://github.com/aseprite/skia/releases/download/${SKIA_TAG}/${SKIA_ZIP}"
+          mkdir -p skia
+          unzip -q "$SKIA_ZIP" -d skia
+          rm -f "$SKIA_ZIP"
+          echo "Skia 已解压到 skia/ 目录："
+          ls skia
+
+      # -----------------------------------------------------------------
+      # CMake 配置 + 编译
+      # -----------------------------------------------------------------
+      - name: 配置 CMake
+        env:
+          RUNNER_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          cd build
+          # 稳健处理：先在 skia 目录下查找 skia 库文件（不同平台文件名不同：
+          # Linux/macOS 为 libskia.a，Windows 为 skia.lib 或 libskia.a 等）
+          SKIA_LIB=$(find ../skia -iname 'libskia*' -o -iname 'skia.lib' | head -n 1)
+          if [ -z "$SKIA_LIB" ]; then
+            echo "未在 ../skia 下找到 skia 库文件"
+            ls -R ../skia || true
+            exit 1
+          fi
+          echo "找到 Skia 库文件：${SKIA_LIB}"
+          # 转为绝对路径
+          SKIA_LIB_ABS=$(cd "$(dirname "$SKIA_LIB")" && pwd)/$(basename "$SKIA_LIB")
+          cmake ../aseprite \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR=../skia \
+            -DSKIA_LIBRARY_DIR="$(dirname "$SKIA_LIB_ABS")" \
+            -DSKIA_LIBRARY="${SKIA_LIB_ABS}"
+
+      - name: 编译 Aseprite
+        run: |
+          set -euo pipefail
+          cd build
+          ninja aseprite
+
+      # -----------------------------------------------------------------
+      # 打包产物
+      # -----------------------------------------------------------------
+      - name: 打包
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          RUNNER_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          cd build
+          case "$RUNNER_PLATFORM" in
+            windows-latest)
+              # 直接压缩整个 bin 目录（含 exe、dll、data 等）
+              ARTIFACT="aseprite-${VERSION}-windows.zip"
+              7z a "$ARTIFACT" ./bin/*
+              ;;
+            macos-latest)
+              ARTIFACT="aseprite-${VERSION}-macos.zip"
+              cd bin && zip -qr "../${ARTIFACT}" . && cd ..
+              ;;
+            ubuntu-latest)
+              ARTIFACT="aseprite-${VERSION}-linux-x64.tar.gz"
+              tar -czf "$ARTIFACT" -C bin .
+              ;;
+          esac
+          echo "产物：${ARTIFACT}"
+          echo "artifact_name=${ARTIFACT}" >> "$GITHUB_ENV"
+
+      - name: 上传构建产物（Artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.artifact_name }}
+          path: build/${{ env.artifact_name }}
+          if-no-files-found: error
+
+      # -----------------------------------------------------------------
+      # 发布 Draft Release
+      # 若同名 release（含草稿）已存在则先删除，再创建草稿并上传产物
+      # -----------------------------------------------------------------
+      - name: 发布 Draft Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          ARTIFACT: ${{ env.artifact_name }}
+        run: |
+          set -euo pipefail
+          # 若同名 release（无论草稿还是正式）已存在，先删除
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "已存在同名 release：${VERSION}，先删除"
+            gh release delete "$VERSION" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || {
+              echo "gh release delete 失败，尝试手动删除 tag"
+              git push --delete "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$VERSION" || true
+            }
+          fi
+          # 创建草稿 release
+          gh release create "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Aseprite ${VERSION} (Auto Build)" \
+            --draft \
+            --notes "自动构建于 $(date -u)"
+          # 上传所有匹配的产物
+          gh release upload "$VERSION" build/aseprite-"${VERSION}"-* \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          echo "已上传产物到 Draft Release：${VERSION}"
