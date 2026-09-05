@@ -292,11 +292,14 @@ jobs:
           fi
           echo "找到 Skia 库文件：${SKIA_LIB}"
           SKIA_LIB_ABS=$(cd "$(dirname "$SKIA_LIB")" && pwd)/$(basename "$SKIA_LIB")
+          # SKIA_DIR 必须用绝对路径，否则 aseprite 的 CMake 会生成相对的
+          # INTERFACE_INCLUDE_DIRECTORIES 而报错
+          SKIA_DIR_ABS=$(cd ../skia && pwd)
           cmake ../aseprite \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DLAF_BACKEND=skia \
-            -DSKIA_DIR=../skia \
+            -DSKIA_DIR="${SKIA_DIR_ABS}" \
             -DSKIA_LIBRARY_DIR="$(dirname "$SKIA_LIB_ABS")" \
             -DSKIA_LIBRARY="${SKIA_LIB_ABS}"
 
