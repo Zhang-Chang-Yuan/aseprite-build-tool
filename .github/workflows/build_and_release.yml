@@ -354,12 +354,14 @@ jobs:
                 fi
               done
               # 兜底：直接在 OpenSSL 常见安装目录中查找
+              # （目录不存在时 find 返回非零，需 || true 避免 set -e 终止脚本）
               for dll in libcrypto-3-x64.dll libssl-3-x64.dll; do
                 if [ ! -f "./bin/$dll" ]; then
                   src=$(find "/c/Program Files/OpenSSL" "/c/Program Files/OpenSSL-Win64" \
                              "/c/Program Files/OpenSSL-v3-Win64" "/c/ProgramData/chocolatey/lib" \
-                             -maxdepth 5 -iname "$dll" 2>/dev/null | head -n 1)
-                  if [ -n "$src" ]; then
+                             "/mingw64/bin" "/usr/bin" \
+                             -maxdepth 5 -iname "$dll" 2>/dev/null | head -n 1) || true
+                  if [ -n "$src" ] && [ -f "$src" ]; then
                     cp "$src" ./bin/ && echo "已复制 ${dll}（${src}）"
                   fi
                 fi
