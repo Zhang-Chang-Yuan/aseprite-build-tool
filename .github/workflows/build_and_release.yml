@@ -350,11 +350,62 @@ jobs:
           cd build
           case "$RUNNER_PLATFORM" in
             windows-latest)
+              # 收集 exe 依赖的非系统 DLL（主要是 OpenSSL 的
+              # libcrypto-3-x64.dll / libssl-3-x64.dll），否则解压后无法运行
+              ldd ./bin/aseprite.exe 2>/dev/null | awk '{print $1" "$3}' | while read -r name path; do
+                [ -n "$path" ] || continue
+                case "$path" in
+                  /c/Windows/*|/mnt/*) continue ;;
+                esac
+                if [ -f "$path" ] && [ ! -f "./bin/$name" ]; then
+                  cp "$path" ./bin/ && echo "已复制依赖 DLL：${name}（${path}）"
+                fi
+              done
+              # 兜底：直接在 OpenSSL 常见安装目录中查找
+              for dll in libcrypto-3-x64.dll libssl-3-x64.dll; do
+                if [ ! -f "./bin/$dll" ]; then
+                  src=$(find "/c/Program Files/OpenSSL" "/c/Program Files/OpenSSL-Win64" \
+                             "/c/Program Files/OpenSSL-v3-Win64" "/c/ProgramData/chocolatey/lib" \
+                             -maxdepth 5 -iname "$dll" 2>/dev/null | head -n 1)
+                  if [ -n "$src" ]; then
+                    cp "$src" ./bin/ && echo "已复制 ${dll}（${src}）"
+                  fi
+                fi
+              done
+              # 校验：缺少 OpenSSL DLL 则失败，避免发布残缺产物
+              for dll in libcrypto-3-x64.dll libssl-3-x64.dll; do
+                if [ ! -f "./bin/$dll" ]; then
+                  echo "错误：bin 下缺少 ${dll}（OpenSSL 运行库），产物不完整"
+                  exit 1
+                fi
+              done
               ARTIFACT="aseprite-${VERSION}-windows-x64.zip"
               # -tzip 指定 zip 格式（7z 默认是 7z 格式）
               7z a -tzip "$ARTIFACT" ./bin/*
               ;;
             macos-latest)
+              # 将非系统 dylib 依赖（如 homebrew 的 libcrypto.3.dylib/libssl.3.dylib）
+              # 复制到 bin 内，改写引用为 @executable_path 并重新签名
+              deps=$(otool -L ./bin/aseprite 2>/dev/null | awk 'NR>1{print $1}' \
+                       | grep -vE '^/usr/lib/|^/System/|^@' || true)
+              for d in $deps; do
+                [ -f "$d" ] || continue
+                name=$(basename "$d")
+                cp -f "$d" ./bin/
+                install_name_tool -change "$d" "@executable_path/${name}" ./bin/aseprite
+                # 被复制 dylib 自身的依赖（如 libssl 依赖 libcrypto）也一并改写
+                sub=$(otool -L "./bin/${name}" 2>/dev/null | awk 'NR>1{print $1}' \
+                        | grep -vE '^/usr/lib/|^/System/|^@' || true)
+                for s in $sub; do
+                  [ -f "$s" ] || continue
+                  sname=$(basename "$s")
+                  if [ -f "./bin/${sname}" ]; then
+                    install_name_tool -change "$s" "@executable_path/${sname}" "./bin/${name}" || true
+                  fi
+                done
+                echo "已内置 ${name}（${d}）"
+              done
+              codesign --force --sign - ./bin/aseprite 2>/dev/null || true
               ARTIFACT="aseprite-${VERSION}-macos-arm64.zip"
               cd bin && zip -qr "../${ARTIFACT}" . && cd ..
               ;;

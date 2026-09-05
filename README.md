@@ -50,6 +50,7 @@
 - ⚖️ 根据 [Aseprite EULA](https://github.com/aseprite/aseprite/blob/main/EULA.txt)，构建产物**仅限个人使用**，请勿公开分发；
 - ⏱️ 注意 GitHub Actions 的分钟数限制（免费额度公共仓库无限，私有仓库有限额）；
 - 🕐 单次构建耗时约 **15–60 分钟**（视平台而定）；
+- 🐧 Linux 版为动态链接（glibc / OpenSSL 3），需要较新的发行版；Windows / macOS 产物已内置所需运行库（DLL / dylib）；
 - 🔄 定时任务可能因 GitHub 负载出现几分钟到几十分钟的延迟，属正常现象。
 
 ### ❓ FAQ
@@ -64,7 +65,7 @@ A: 可在 Actions 页面对应运行中点击 **Re-run failed jobs** 重试失�
 A: GitHub Actions 原生不支持在 `workflow_dispatch` 输入中提供动态下拉列表（choice 选项必须写死），因此版本 tag 采用字符串输入，留空即自动使用最新稳定版。
 
 **Q: Windows 版提示缺少 DLL 怎么办？**
-A: 压缩包内已包含 `build/bin` 下的全部内容（含运行所需 DLL 与 data 目录）。若仍提示缺少 DLL，请确认解压后未删除任何文件，并安装 [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)。
+A: 当前构建产物已自动打包 `libcrypto-3-x64.dll` / `libssl-3-x64.dll`（OpenSSL 运行库）。若下载的是早期构建的压缩包，可手动从 [Win64 OpenSSL](https://slproweb.com/products/Win32OpenSSL.html) 安装目录复制这两个 DLL 到 aseprite.exe 同级目录，或重新触发一次构建获取新包。若仍提示缺少其它 DLL，请安装 [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)。
 
 **Q: 如何下载草稿（Draft）Release？**
 A: 登录 GitHub 后，进入仓库主页右侧的 **Releases** 栏，或直接访问 `https://github.com/<用户名>/aseprite-build-tool/releases` 页面，草稿条目标记为 *Draft*，点击进入后可下载 Assets 中的产物，也可手动将其发布为正式 Release。
@@ -125,6 +126,7 @@ The workflow runs daily at **UTC 2:00**, checks the official [aseprite/aseprite]
 - ⚖️ Per the [Aseprite EULA](https://github.com/aseprite/aseprite/blob/main/EULA.txt), built artifacts are **for personal use only** — do not redistribute publicly;
 - ⏱️ Be aware of GitHub Actions usage minute limits;
 - 🕐 A single build takes about **15–60 minutes** depending on the platform;
+- 🐧 The Linux build is dynamically linked (glibc / OpenSSL 3) and needs a reasonably modern distribution; Windows / macOS artifacts bundle their required runtime libraries (DLLs / dylibs);
 - 🔄 Scheduled runs may be delayed by a few minutes under GitHub load — this is normal.
 
 ### ❓ FAQ
@@ -139,7 +141,7 @@ A: On the Actions run page, click **Re-run failed jobs** to retry, or simply tri
 A: GitHub Actions does not support dynamic option lists in `workflow_dispatch` inputs (choices must be static), so the version is a string input. Leaving it empty builds the latest stable version automatically.
 
 **Q: Windows reports missing DLLs. What should I do?**
-A: The archive contains the full `build/bin` directory (including required DLLs and the data folder). If DLLs are still reported missing, make sure no files were deleted after extraction, and install the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe).
+A: Current artifacts automatically bundle `libcrypto-3-x64.dll` / `libssl-3-x64.dll` (the OpenSSL runtime). If you downloaded an earlier build, either copy these two DLLs from a [Win64 OpenSSL](https://slproweb.com/products/Win32OpenSSL.html) installation next to `aseprite.exe`, or re-trigger a build to get a fresh archive. If other DLLs are still reported missing, install the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe).
 
 **Q: How do I download a Draft Release?**
 A: Sign in to GitHub, then open the **Releases** section on the repository page or visit `https://github.com/<user>/aseprite-build-tool/releases`. Draft entries are labeled *Draft*; open one to download the assets, or publish it as a full release manually.
