@@ -7,7 +7,7 @@
 本项目通过 **GitHub Actions** 从 [aseprite/aseprite](https://github.com/aseprite/aseprite) 官方源码自动编译 Aseprite，并将构建产物发布为本仓库的 **Draft Release（草稿发布）**，以规避 Aseprite EULA 对公开分发二进制文件的限制。
 
 - 支持手动触发构建指定版本 / 指定平台
-- 支持每日自动检测官方新稳定版本并全平台构建
+- 支持一键批量补齐所有缺失的「版本×平台」组合
 - **仅构建 v1.3.14 及之后的版本**（原因见下方「版本范围说明」）
 - 产物仅以草稿形式发布，仅仓库所有者可见
 
@@ -25,7 +25,7 @@
 2. **更老的版本没有 Skia 后端**：v1.1.x 及更早版本（2017 年以前）的源码还没有 `laf`/Skia 渲染后端，构建体系完全不同；
 3. **成本考虑**：在 CI 上为每个旧版本单独搭建旧工具链成本极高且几乎必然失败，故不做尝试。
 
-未来官方发布的新版本（如 v1.3.19、v1.4.0）只要仍使用可用的预编译 Skia，就会被自动检测并构建。范围阈值由工作流中的 `MIN_VERSION` 环境变量控制，可自行修改。
+官方未来发布的新版本（如 v1.3.19、v1.4.0）只要仍使用可用的预编译 Skia，就会在勾选 build_all 运行时被检测并构建。范围阈值由工作流中的 `MIN_VERSION` 环境变量控制，可自行修改。
 
 ### 🚀 快速开始
 
@@ -40,9 +40,11 @@
    - **构建全部缺失版本（build_all）**：勾选后等同定时任务逻辑，一次性把所有缺失的版本在三个平台上全部构建；
 5. 点击 **Run workflow** 开始构建。
 
-#### 自动构建
+#### 批量构建（build_all）
 
-工作流每天 **UTC 2:00**（北京时间 10:00）自动运行，通过 GitHub API 检测 [aseprite/aseprite](https://github.com/aseprite/aseprite) 官方新增的稳定版本 tag（自动跳过 alpha / beta / rc / dev / SNAPSHOT 等预发布版本，且仅保留 v1.3.14 及之后的版本），与本仓库已有 Release（含草稿）对比后，对缺失的新版本自动构建全部三个平台并发布草稿。
+在手动触发时勾选 **构建全部缺失的版本×平台组合（build_all）**，工作流会对比 [aseprite/aseprite](https://github.com/aseprite/aseprite) 官方 tags（仅 v1.3.14 及之后的稳定版本）与本仓库已有 Release（含草稿），把所有缺失的「版本×平台」组合一次性构建补齐。已构建过的组合不会重复构建；再次构建同一产物时会以覆盖方式上传，保证始终是最新构建。
+
+> ℹ️ 本项目**未启用定时构建**（schedule），一切构建均由手动触发。如需每日自动检测新版本，可在 `.github/workflows/build_and_release.yml` 中自行添加 `schedule` 触发器（与 build_all 逻辑完全兼容）。
 
 ### ⚠️ 注意事项
 
@@ -50,8 +52,7 @@
 - ⚖️ 根据 [Aseprite EULA](https://github.com/aseprite/aseprite/blob/main/EULA.txt)，构建产物**仅限个人使用**，请勿公开分发；
 - ⏱️ 注意 GitHub Actions 的分钟数限制（免费额度公共仓库无限，私有仓库有限额）；
 - 🕐 单次构建耗时约 **15–60 分钟**（视平台而定）；
-- 🐧 Linux 版为动态链接（glibc / OpenSSL 3），需要较新的发行版；Windows / macOS 产物已内置所需运行库（DLL / dylib）；
-- 🔄 定时任务可能因 GitHub 负载出现几分钟到几十分钟的延迟，属正常现象。
+- 🐧 Linux 版为动态链接（glibc / OpenSSL 3），需要较新的发行版；Windows / macOS 产物已内置所需运行库（DLL / dylib）。
 
 ### ❓ FAQ
 
@@ -83,7 +84,7 @@ A: 登录 GitHub 后，进入仓库主页右侧的 **Releases** 栏，或直接�
 This project uses **GitHub Actions** to automatically build Aseprite from the official [aseprite/aseprite](https://github.com/aseprite/aseprite) source code and publish the artifacts as **Draft Releases** in this repository, working around the Aseprite EULA restriction on public redistribution.
 
 - Manual trigger with custom version / platform
-- Daily automatic detection of new stable official tags, building all three platforms
+- One-click batch fill of all missing version × platform combinations
 - **Only versions v1.3.14 and later are built** (see "Supported Version Range" below)
 - Artifacts are published as drafts, visible only to the repository owner
 
@@ -101,7 +102,7 @@ This project **only builds versions [v1.3.14](https://github.com/aseprite/asepri
 2. **Much older versions have no Skia backend at all**: v1.1.x and earlier (pre-2017) predate the `laf`/Skia rendering backend and use a completely different build system;
 3. **Cost**: setting up per-version legacy toolchains on CI for each old release is expensive and almost guaranteed to fail, so it is not attempted.
 
-Future official releases (e.g. v1.3.19, v1.4.0) are detected and built automatically as long as a usable pre-built Skia exists. The threshold is controlled by the `MIN_VERSION` environment variable in the workflow file.
+Future official releases (e.g. v1.3.19, v1.4.0) are detected and built when running with build_all, as long as a usable pre-built Skia exists. The threshold is controlled by the `MIN_VERSION` environment variable in the workflow file.
 
 ### 🚀 Quick Start
 
@@ -116,9 +117,11 @@ Future official releases (e.g. v1.3.19, v1.4.0) are detected and built automatic
    - **Build all missing versions (build_all)**: check this to run the same logic as the scheduled task — build every missing version on all three platforms;
 5. Click **Run workflow** to start.
 
-#### Automatic Builds
+#### Batch Build (build_all)
 
-The workflow runs daily at **UTC 2:00**, checks the official [aseprite/aseprite](https://github.com/aseprite/aseprite) tags via the GitHub API (skipping pre-release tags such as alpha / beta / rc / dev / SNAPSHOT, and keeping only v1.3.14 and later), compares them with existing Releases (including drafts) in this repository, and automatically builds any missing versions on all three platforms.
+When triggering manually, check **build_all** and the workflow compares the official [aseprite/aseprite](https://github.com/aseprite/aseprite) tags (stable versions v1.3.14 and later only) with existing Releases (including drafts) in this repository, then builds every missing version × platform combination in one run. Already-built combinations are not rebuilt; re-built artifacts are uploaded with overwrite so they are always the latest build.
+
+> ℹ️ This project does **not** use scheduled builds (`schedule`) — everything is triggered manually. If you want daily automatic detection of new versions, add a `schedule` trigger to `.github/workflows/build_and_release.yml` yourself (fully compatible with the build_all logic).
 
 ### ⚠️ Notes
 
@@ -126,8 +129,7 @@ The workflow runs daily at **UTC 2:00**, checks the official [aseprite/aseprite]
 - ⚖️ Per the [Aseprite EULA](https://github.com/aseprite/aseprite/blob/main/EULA.txt), built artifacts are **for personal use only** — do not redistribute publicly;
 - ⏱️ Be aware of GitHub Actions usage minute limits;
 - 🕐 A single build takes about **15–60 minutes** depending on the platform;
-- 🐧 The Linux build is dynamically linked (glibc / OpenSSL 3) and needs a reasonably modern distribution; Windows / macOS artifacts bundle their required runtime libraries (DLLs / dylibs);
-- 🔄 Scheduled runs may be delayed by a few minutes under GitHub load — this is normal.
+- 🐧 The Linux build is dynamically linked (glibc / OpenSSL 3) and needs a reasonably modern distribution; Windows / macOS artifacts bundle their required runtime libraries (DLLs / dylibs).
 
 ### ❓ FAQ
 

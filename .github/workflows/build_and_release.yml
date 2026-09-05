@@ -1,12 +1,9 @@
 # =============================================================================
 # Aseprite 自动构建与发布工作流
 #
-# 功能：
-#   1. workflow_dispatch 手动触发：可指定 Aseprite 版本 tag（留空构建最新稳定版）
-#      与平台；也可勾选 build_all 一次性补齐所有缺失的「版本×平台」组合
-#      （等同定时任务逻辑）。
-#   2. schedule 定时触发：每天 UTC 2:00 检查 aseprite/aseprite 官方新稳定 tag，
-#      与本仓库已有 Release（含草稿）对比，自动构建缺失的「版本×平台」组合。
+# 触发方式：仅手动（workflow_dispatch）。
+#   - 指定版本与平台构建单个组合；
+#   - 勾选 build_all 时自动补齐所有缺失的「版本×平台」组合。
 #
 # 版本范围：仅构建 v1.3.14 及之后的版本。
 #   原因：只有这些版本的官方 laf 子模块固定使用 aseprite/skia 提供的
@@ -41,15 +38,10 @@ on:
           - macos-latest
           - ubuntu-latest
       build_all:
-        description: '补齐全部缺失的版本×平台组合（等同定时任务逻辑）'
+        description: '补齐全部缺失的版本×平台组合'
         required: false
         default: false
         type: boolean
-  # 每天定时检查新版本
-  schedule:
-    # 每天 UTC 2:00（北京时间 10:00）
-    # 注意：定时功能验证期间临时改为 UTC 5:30，验证完成后恢复为 '0 2 * * *'
-    - cron: '30 5 * * *'
 
 # 同一事件类型的运行排队执行，不取消进行中的运行
 concurrency:
@@ -67,11 +59,11 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Job 1：计算要构建的「版本×平台」组合（所有事件都会运行）
+  # Job 1：计算要构建的「版本×平台」组合（手动触发时运行）
   #  - 手动单发（未勾选 build_all）：单个组合，版本取输入（空则由构建步骤解析
   #    为最新稳定版），平台取输入；
-  #  - schedule 或 build_all：对比 aseprite/aseprite 官方 tags 与本仓库已有
-  #    releases（含 draft），输出全部缺失组合。
+  #  - 勾选 build_all：对比 aseprite/aseprite 官方 tags 与本仓库已有 releases
+  #    （含 draft），输出全部缺失组合。
   # 输出 JSON 数组：[ {"version":"v1.3.14","platform":"windows-latest"}, ... ]
   # ---------------------------------------------------------------------------
   check-and-trigger:
@@ -91,8 +83,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # ---- 仅处理 schedule 与 workflow_dispatch 事件 ----
-          if [ "$EVENT" != "schedule" ] && [ "$EVENT" != "workflow_dispatch" ]; then
+          # ---- 仅处理 workflow_dispatch 事件 ----
+          if [ "$EVENT" != "workflow_dispatch" ]; then
             echo "事件 ${EVENT} 不触发构建"
             echo "combos=[]" >> "$GITHUB_OUTPUT"
             exit 0
@@ -176,8 +168,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Job 2：构建矩阵
-  #  - workflow_dispatch（未勾选 build_all）：单个「版本×平台」组合。
-  #  - schedule 或 build_all：全部缺失的「版本×平台」组合。
+  #  - 手动单发（未勾选 build_all）：单个「版本×平台」组合；
+  #  - 勾选 build_all：全部缺失的「版本×平台」组合。
   # ---------------------------------------------------------------------------
   build:
     needs: check-and-trigger
