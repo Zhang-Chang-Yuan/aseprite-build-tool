@@ -66,23 +66,44 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Job 1：检查缺口（schedule 事件，或手动勾选 build_all 时运行）
-  # 对比 aseprite/aseprite 官方 tags 与本仓库已有 releases（含 draft），
-  # 按「版本×平台」组合输出缺失项 JSON 数组：
-  #   [ {"version":"v1.3.14","platform":"windows-latest"}, ... ]
+  # Job 1：计算要构建的「版本×平台」组合（所有事件都会运行）
+  #  - 手动单发（未勾选 build_all）：单个组合，版本取输入（空则由构建步骤解析
+  #    为最新稳定版），平台取输入；
+  #  - schedule 或 build_all：对比 aseprite/aseprite 官方 tags 与本仓库已有
+  #    releases（含 draft），输出全部缺失组合。
+  # 输出 JSON 数组：[ {"version":"v1.3.14","platform":"windows-latest"}, ... ]
   # ---------------------------------------------------------------------------
   check-and-trigger:
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.build_all == true) }}
+    if: ${{ always() }}
     outputs:
-      missing_combos: ${{ steps.check.outputs.missing_combos }}
+      combos: ${{ steps.check.outputs.combos }}
     steps:
-      - name: 检查 aseprite/aseprite 官方新版本
+      - name: 计算构建组合
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          BUILD_ALL: ${{ inputs.build_all }}
+          INPUT_VERSION: ${{ inputs.aseprite_version }}
+          INPUT_PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
+
+          # ---- 仅处理 schedule 与 workflow_dispatch 事件 ----
+          if [ "$EVENT" != "schedule" ] && [ "$EVENT" != "workflow_dispatch" ]; then
+            echo "事件 ${EVENT} 不触发构建"
+            echo "combos=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ---- 0. 手动单发模式：直接输出输入的组合 ----
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$BUILD_ALL" != "true" ]; then
+            echo "手动单发模式：version=${INPUT_VERSION:-<latest>} platform=${INPUT_PLATFORM}"
+            combos="[{\"version\":\"${INPUT_VERSION}\",\"platform\":\"${INPUT_PLATFORM}\"}]"
+            echo "combos=${combos}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # ---- 1. 获取本仓库全部 releases（含 draft），汇总各 tag 已有产物后缀 ----
           # 平台产物命名：-windows-x64.zip / -macos-arm64.zip / -linux-x64.tar.gz
@@ -100,7 +121,7 @@ jobs:
 
           has_asset() {  # has_asset <tag> <suffix>
             grep -F "\"tag\":\"$1\"" "$rel_file" 2>/dev/null \
-              | jq -r --arg s "$2" '.assets[] | select(endswith($s))' 2>/dev/null | grep -q . 
+              | jq -r --arg s "$2" '.assets[]? | select(endswith($s))' 2>/dev/null | grep -q .
           }
 
           # ---- 2. 获取 aseprite/aseprite 官方 tags（分页拉取）----
@@ -149,7 +170,7 @@ jobs:
           done < "$stable_file"
           combos_json="${combos_json}]"
 
-          echo "missing_combos=${combos_json}" >> "$GITHUB_OUTPUT"
+          echo "combos=${combos_json}" >> "$GITHUB_OUTPUT"
           echo "最终输出：${combos_json}"
 
   # ---------------------------------------------------------------------------
@@ -161,21 +182,13 @@ jobs:
     needs: check-and-trigger
     if: >-
       always() &&
-      (
-        (github.event_name == 'workflow_dispatch' && inputs.build_all != true) ||
-        (
-          (github.event_name == 'schedule' || inputs.build_all == true) &&
-          needs.check-and-trigger.result == 'success' &&
-          needs.check-and-trigger.outputs.missing_combos != '' &&
-          needs.check-and-trigger.outputs.missing_combos != '[]'
-        )
-      )
+      needs.check-and-trigger.result == 'success' &&
+      needs.check-and-trigger.outputs.combos != '' &&
+      needs.check-and-trigger.outputs.combos != '[]'
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ (github.event_name == 'workflow_dispatch' && inputs.build_all != true)
-          && fromJSON(format('[{{"version": "{0}", "platform": "{1}"}}]', inputs.aseprite_version, inputs.platform))
-          || fromJSON(needs.check-and-trigger.outputs.missing_combos) }}
+        include: ${{ fromJSON(needs.check-and-trigger.outputs.combos) }}
     runs-on: ${{ matrix.platform }}
     defaults:
       run:
