@@ -2,9 +2,15 @@
 # Aseprite 自动构建与发布工作流
 #
 # 功能：
-#   1. workflow_dispatch 手动触发：可指定 Aseprite 版本 tag（留空构建最新稳定版）与平台。
+#   1. workflow_dispatch 手动触发：可指定 Aseprite 版本 tag（留空构建最新稳定版）
+#      与平台；也可勾选 build_all 一次性构建所有缺失版本（等同定时任务逻辑）。
 #   2. schedule 定时触发：每天 UTC 2:00 检查 aseprite/aseprite 官方新稳定 tag，
 #      与本仓库已有 Release（含草稿）对比，发现缺失版本则自动构建全部三个平台。
+#
+# 版本范围：仅构建 v1.3.14 及之后的版本。
+#   原因：只有这些版本的官方 laf 子模块固定使用 aseprite/skia 提供的
+#   m124 预编译 Skia（三平台包齐全）；更早版本依赖的旧版 Skia 没有预编译包，
+#   v1.1 及以前甚至没有 Skia 后端，无法在 CI 上构建。
 #
 # 产物以 Draft Release（草稿）形式发布，仅仓库所有者/协作者可见，
 # 用于规避 Aseprite EULA 对公开分发的限制。
@@ -17,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       aseprite_version:
-        description: 'Aseprite 版本 tag，如 v1.3.10.2，留空则构建最新稳定版'
+        description: 'Aseprite 版本 tag（仅 v1.3.14+，如 v1.3.18.3；留空构建最新稳定版）'
         required: false
         default: ''
         type: string
@@ -30,28 +36,40 @@ on:
           - windows-latest
           - macos-latest
           - ubuntu-latest
+      build_all:
+        description: '构建全部缺失版本（三平台，等同定时任务逻辑）'
+        required: false
+        default: false
+        type: boolean
   # 每天定时检查新版本
   schedule:
     # 每天 UTC 2:00（北京时间 10:00）
-    - cron: '0 2 * * *'
+    # 注意：全量补构建完成前临时改为 UTC 6:00，完成后恢复为 '0 2 * * *'
+    - cron: '0 6 * * *'
 
-# 同一并发组排队执行，不取消进行中的运行
+# 同一事件类型的运行排队执行，不取消进行中的运行
 concurrency:
-  group: aseprite-build-and-release
+  group: ${{ github.workflow }}-${{ github.event_name }}
   cancel-in-progress: false
 
 permissions:
   contents: write
 
+env:
+  # v1.3.14+ 的 aseprite 官方固定使用的 Skia 预编译版本（laf/misc/skia-tag.txt）
+  SKIA_TAG: m124-08a5439a6b
+  # 只构建此版本及之后的稳定版（旧版本缺少可用的预编译 Skia，无法构建）
+  MIN_VERSION: v1.3.14
+
 jobs:
   # ---------------------------------------------------------------------------
-  # Job 1：检查官方新版本（仅 schedule 事件运行）
+  # Job 1：检查官方新版本（schedule 事件，或手动勾选 build_all 时运行）
   # 对比 aseprite/aseprite 官方 tags 与本仓库已有 releases（含 draft），
   # 输出缺失的稳定版本 JSON 数组。
   # ---------------------------------------------------------------------------
   check-and-trigger:
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.build_all == true) }}
     outputs:
       missing_versions: ${{ steps.check.outputs.missing_versions }}
     steps:
@@ -70,18 +88,11 @@ jobs:
               -H "Authorization: Bearer ${GH_TOKEN}" \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}")
             count=$(echo "$resp" | jq -r 'length')
-            if [ "$count" -eq 0 ]; then
-              break
-            fi
+            if [ "$count" -eq 0 ]; then break; fi
             echo "$resp" | jq -r '.[].tag_name' >> "$local_tags_file"
             page=$((page + 1))
           done
-          # 去重排序
-          if [ -s "$local_tags_file" ]; then
-            sort -u "$local_tags_file" -o "$local_tags_file"
-          fi
-          echo "本仓库已有 releases（含 draft）："
-          cat "$local_tags_file" || true
+          sort -u "$local_tags_file" -o "$local_tags_file" 2>/dev/null || true
 
           # ---- 2. 获取 aseprite/aseprite 官方 tags（分页拉取）----
           official_tags_file="$(mktemp)"
@@ -90,52 +101,55 @@ jobs:
             resp=$(curl -sSf \
               "https://api.github.com/repos/aseprite/aseprite/tags?per_page=100&page=${page}")
             count=$(echo "$resp" | jq -r 'length')
-            if [ "$count" -eq 0 ]; then
-              break
-            fi
+            if [ "$count" -eq 0 ]; then break; fi
             echo "$resp" | jq -r '.[].name' >> "$official_tags_file"
             page=$((page + 1))
-            # 安全上限，防止无限翻页
-            if [ "$page" -gt 20 ]; then
-              break
-            fi
+            if [ "$page" -gt 10 ]; then break; fi   # 安全上限
           done
-          sort -u "$official_tags_file" -o "$official_tags_file"
 
-          # ---- 3. 过滤：只保留稳定版本 vX.Y.Z 或 vX.Y.Z.N（跳过 alpha/beta/rc/dev/SNAPSHOT 等）----
+          # ---- 3. 过滤：仅保留 vX.Y.Z(.N) 格式且 >= MIN_VERSION 的稳定 tag ----
+          # （旧版本缺少可用的预编译 Skia，无法在 CI 上构建，详见 README）
           stable_file="$(mktemp)"
-          grep -E '^v[0-9]+(\.[0-9]+)+$' "$official_tags_file" > "$stable_file" || true
-          echo "官方稳定版本 tag："
+          grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$' "$official_tags_file" | while read -r tag; do
+            if [ "$(printf '%s\n%s\n' "${MIN_VERSION}" "$tag" | sort -V | head -n 1)" = "${MIN_VERSION}" ]; then
+              echo "$tag"
+            fi
+          done > "$stable_file" || true
+          sort -u "$stable_file" -o "$stable_file"
+          echo "目标范围内的官方版本（>= ${MIN_VERSION}）："
           cat "$stable_file" || true
+          echo "本仓库已有 releases（含 draft）："
+          cat "$local_tags_file" || true
 
-          # ---- 4. 对比找出缺失版本（按 tag 排序取最新在前，这里保留全部缺失）----
+          # ---- 4. 对比找出缺失版本（最新在前）----
           missing="$(comm -23 "$stable_file" "$local_tags_file" | sort -rV)"
           echo "缺失版本："
           echo "$missing" || true
 
-          # ---- 5. 输出为 JSON 数组，并设置 step output ----
-          json=$(echo "$missing" | jq -R . | jq -s -c .)
-          # 空输入时输出 []
+          # ---- 5. 输出为 JSON 数组 ----
           if [ -z "$(echo "$missing" | tr -d '[:space:]')" ]; then
             json="[]"
+          else
+            json=$(echo "$missing" | jq -R . | jq -s -c .)
           fi
           echo "missing_versions=${json}" >> "$GITHUB_OUTPUT"
           echo "最终输出：${json}"
 
   # ---------------------------------------------------------------------------
   # Job 2：构建矩阵
-  #  - workflow_dispatch：version 取输入（空则解析为 latest，再由构建步骤解析），
-  #    platform 取用户选择。
-  #  - schedule：version 取缺失版本数组，platform 为三个平台。
+  #  - workflow_dispatch（未勾选 build_all）：version 取输入（空则解析为最新稳定
+  #    版），platform 取用户选择，单组合。
+  #  - schedule 或 build_all：version 取缺失版本数组，platform 为三个平台。
   # ---------------------------------------------------------------------------
   build:
     needs: check-and-trigger
     if: >-
       always() &&
       (
-        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'workflow_dispatch' && inputs.build_all != true) ||
         (
-          github.event_name == 'schedule' &&
+          (github.event_name == 'schedule' || inputs.build_all == true) &&
+          needs.check-and-trigger.result == 'success' &&
           needs.check-and-trigger.outputs.missing_versions != '' &&
           needs.check-and-trigger.outputs.missing_versions != '[]'
         )
@@ -143,10 +157,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ${{ github.event_name == 'workflow_dispatch'
+        version: ${{ (github.event_name == 'workflow_dispatch' && inputs.build_all != true)
           && fromJSON(format('["{0}"]', inputs.aseprite_version))
           || fromJSON(needs.check-and-trigger.outputs.missing_versions) }}
-        platform: ${{ github.event_name == 'workflow_dispatch'
+        platform: ${{ (github.event_name == 'workflow_dispatch' && inputs.build_all != true)
           && fromJSON(format('["{0}"]', inputs.platform))
           || fromJSON('["windows-latest", "macos-latest", "ubuntu-latest"]') }}
     runs-on: ${{ matrix.platform }}
@@ -171,15 +185,20 @@ jobs:
             echo "输入为空/latest，使用官方最新 release：${VERSION}"
           fi
           # 仅支持稳定版本，拒绝 alpha/beta/rc/dev/SNAPSHOT 等预发布 tag
-          if ! echo "$VERSION" | grep -Eq '^v[0-9]+(\.[0-9]+)+$'; then
+          if ! echo "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
             echo "不支持的版本格式：${VERSION}（仅支持 vX.Y.Z 或 vX.Y.Z.N 的稳定版本）"
+            exit 1
+          fi
+          # 仅支持 MIN_VERSION 及以上（旧版本缺少可用的预编译 Skia，详见 README）
+          if [ "$(printf '%s\n%s\n' "${MIN_VERSION}" "$VERSION" | sort -V | head -n 1)" != "${MIN_VERSION}" ]; then
+            echo "不支持的版本：${VERSION}（本仓库仅构建 ${MIN_VERSION} 及以上版本，原因见 README）"
             exit 1
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "最终构建版本：${VERSION}"
 
       # -----------------------------------------------------------------
-      # 安装依赖（三个平台 runner 自带 cmake；仅补充 ninja 与 Linux X11 头文件）
+      # 安装依赖（runner 自带 cmake；仅补充 ninja 与 Linux X11 头文件）
       # -----------------------------------------------------------------
       - name: 安装依赖
         env:
@@ -188,13 +207,13 @@ jobs:
           set -euo pipefail
           case "$RUNNER_PLATFORM" in
             windows-latest)
-              # windows-latest 自带 cmake，安装 ninja（若缺失）
-              cmake --version || true
+              # windows-latest 自带 cmake，确保 ninja 存在
+              cmake --version >/dev/null
               ninja --version || choco install ninja -y --no-progress
               ;;
             macos-latest)
               # macOS 自带 cmake，安装 ninja
-              cmake --version || true
+              cmake --version >/dev/null
               brew install ninja
               ;;
             ubuntu-latest)
@@ -203,7 +222,7 @@ jobs:
               sudo apt-get install -y --no-install-recommends \
                 ninja-build libx11-dev libxcursor-dev libxi-dev \
                 libxrandr-dev libgl1-mesa-dev libfontconfig1-dev
-              cmake --version
+              cmake --version >/dev/null
               ninja --version
               ;;
             *)
@@ -211,6 +230,13 @@ jobs:
               exit 1
               ;;
           esac
+
+      # -----------------------------------------------------------------
+      # Windows：配置 MSVC 编译环境（Ninja 生成器需要 cl.exe 在 PATH 中）
+      # -----------------------------------------------------------------
+      - name: 配置 MSVC 环境 (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
 
       # -----------------------------------------------------------------
       # 克隆 Aseprite 源码（指定 tag，递归子模块，浅克隆）
@@ -224,24 +250,27 @@ jobs:
             https://github.com/aseprite/aseprite.git
 
       # -----------------------------------------------------------------
-      # 下载 Skia（aseprite/skia 官方预编译包，m124 分支）
+      # 下载 Skia（aseprite/skia 官方预编译包；v1.3.14+ 使用 m124）
       # -----------------------------------------------------------------
       - name: 下载 Skia
         env:
           RUNNER_PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          # aseprite/skia 的 release tag 为 m124-08a5439a6b，资源名为 Skia-<平台>-Release-x64.zip
-          SKIA_TAG="m124-08a5439a6b"
           case "$RUNNER_PLATFORM" in
             windows-latest) SKIA_ZIP="Skia-Windows-Release-x64.zip" ;;
-            macos-latest)   SKIA_ZIP="Skia-macOS-Release-x64.zip" ;;
+            macos-latest)   SKIA_ZIP="Skia-macOS-Release-arm64.zip" ;;
             ubuntu-latest)  SKIA_ZIP="Skia-Linux-Release-x64.zip" ;;
           esac
           curl -sSfL -o "$SKIA_ZIP" \
             "https://github.com/aseprite/skia/releases/download/${SKIA_TAG}/${SKIA_ZIP}"
           mkdir -p skia
-          unzip -q "$SKIA_ZIP" -d skia
+          # Windows 的 Git Bash 不一定有 unzip，使用 7z；其余平台用 unzip
+          if [ "$RUNNER_PLATFORM" = "windows-latest" ]; then
+            7z x -y -oskia "$SKIA_ZIP" > /dev/null
+          else
+            unzip -q "$SKIA_ZIP" -d skia
+          fi
           rm -f "$SKIA_ZIP"
           echo "Skia 已解压到 skia/ 目录："
           ls skia
@@ -250,22 +279,18 @@ jobs:
       # CMake 配置 + 编译
       # -----------------------------------------------------------------
       - name: 配置 CMake
-        env:
-          RUNNER_PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
           mkdir -p build
           cd build
-          # 稳健处理：先在 skia 目录下查找 skia 库文件（不同平台文件名不同：
-          # Linux/macOS 为 libskia.a，Windows 为 skia.lib 或 libskia.a 等）
-          SKIA_LIB=$(find ../skia -iname 'libskia*' -o -iname 'skia.lib' | head -n 1)
+          # 先在 skia 目录下查找 skia 库文件（Linux/macOS 为 libskia.a，Windows 为 skia.lib）
+          SKIA_LIB=$(find ../skia \( -iname 'libskia.a' -o -iname 'skia.lib' \) | head -n 1)
           if [ -z "$SKIA_LIB" ]; then
             echo "未在 ../skia 下找到 skia 库文件"
             ls -R ../skia || true
             exit 1
           fi
           echo "找到 Skia 库文件：${SKIA_LIB}"
-          # 转为绝对路径
           SKIA_LIB_ABS=$(cd "$(dirname "$SKIA_LIB")" && pwd)/$(basename "$SKIA_LIB")
           cmake ../aseprite \
             -G Ninja \
@@ -280,6 +305,8 @@ jobs:
           set -euo pipefail
           cd build
           ninja aseprite
+          # 确保 bin/data 资源目录已复制（个别版本 copy_data 是独立目标）
+          ninja copy_data || echo "copy_data 目标不存在，跳过"
 
       # -----------------------------------------------------------------
       # 打包产物
@@ -293,12 +320,12 @@ jobs:
           cd build
           case "$RUNNER_PLATFORM" in
             windows-latest)
-              # 直接压缩整个 bin 目录（含 exe、dll、data 等）
-              ARTIFACT="aseprite-${VERSION}-windows.zip"
-              7z a "$ARTIFACT" ./bin/*
+              ARTIFACT="aseprite-${VERSION}-windows-x64.zip"
+              # -tzip 指定 zip 格式（7z 默认是 7z 格式）
+              7z a -tzip "$ARTIFACT" ./bin/*
               ;;
             macos-latest)
-              ARTIFACT="aseprite-${VERSION}-macos.zip"
+              ARTIFACT="aseprite-${VERSION}-macos-arm64.zip"
               cd bin && zip -qr "../${ARTIFACT}" . && cd ..
               ;;
             ubuntu-latest)
@@ -309,7 +336,7 @@ jobs:
           echo "产物：${ARTIFACT}"
           echo "artifact_name=${ARTIFACT}" >> "$GITHUB_ENV"
 
-      - name: 上传构建产物（Artifact）
+      - name: 上传构建产物（Artifact 备份）
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.artifact_name }}
