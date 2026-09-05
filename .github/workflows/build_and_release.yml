@@ -3,17 +3,21 @@
 #
 # 功能：
 #   1. workflow_dispatch 手动触发：可指定 Aseprite 版本 tag（留空构建最新稳定版）
-#      与平台；也可勾选 build_all 一次性构建所有缺失版本（等同定时任务逻辑）。
+#      与平台；也可勾选 build_all 一次性补齐所有缺失的「版本×平台」组合
+#      （等同定时任务逻辑）。
 #   2. schedule 定时触发：每天 UTC 2:00 检查 aseprite/aseprite 官方新稳定 tag，
-#      与本仓库已有 Release（含草稿）对比，发现缺失版本则自动构建全部三个平台。
+#      与本仓库已有 Release（含草稿）对比，自动构建缺失的「版本×平台」组合。
 #
 # 版本范围：仅构建 v1.3.14 及之后的版本。
 #   原因：只有这些版本的官方 laf 子模块固定使用 aseprite/skia 提供的
 #   m124 预编译 Skia（三平台包齐全）；更早版本依赖的旧版 Skia 没有预编译包，
 #   v1.1 及以前甚至没有 Skia 后端，无法在 CI 上构建。
 #
-# 产物以 Draft Release（草稿）形式发布，仅仓库所有者/协作者可见，
-# 用于规避 Aseprite EULA 对公开分发的限制。
+# 发布策略（并发安全）：
+#   - 目标 Release 为 Draft（草稿，仅仓库所有者可见，规避 EULA 公开分发限制）；
+#   - 已存在的草稿不会被删除，产物以 --clobber 方式覆盖上传（始终为最新构建），
+#     因此同一版本的三个平台任务可以安全并发；
+#   - 仅当同名 Release 已被发布为正式版（非草稿）时，先删除再重建为草稿。
 # =============================================================================
 
 name: Build and Release Aseprite
@@ -37,7 +41,7 @@ on:
           - macos-latest
           - ubuntu-latest
       build_all:
-        description: '构建全部缺失版本（三平台，等同定时任务逻辑）'
+        description: '补齐全部缺失的版本×平台组合（等同定时任务逻辑）'
         required: false
         default: false
         type: boolean
@@ -62,15 +66,16 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Job 1：检查官方新版本（schedule 事件，或手动勾选 build_all 时运行）
+  # Job 1：检查缺口（schedule 事件，或手动勾选 build_all 时运行）
   # 对比 aseprite/aseprite 官方 tags 与本仓库已有 releases（含 draft），
-  # 输出缺失的稳定版本 JSON 数组。
+  # 按「版本×平台」组合输出缺失项 JSON 数组：
+  #   [ {"version":"v1.3.14","platform":"windows-latest"}, ... ]
   # ---------------------------------------------------------------------------
   check-and-trigger:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.build_all == true) }}
     outputs:
-      missing_versions: ${{ steps.check.outputs.missing_versions }}
+      missing_combos: ${{ steps.check.outputs.missing_combos }}
     steps:
       - name: 检查 aseprite/aseprite 官方新版本
         id: check
@@ -79,8 +84,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # ---- 1. 获取本仓库已有 releases（含 draft），提取 tag 名集合 ----
-          local_tags_file="$(mktemp)"
+          # ---- 1. 获取本仓库全部 releases（含 draft），汇总各 tag 已有产物后缀 ----
+          # 平台产物命名：-windows-x64.zip / -macos-arm64.zip / -linux-x64.tar.gz
+          rel_file="$(mktemp)"
           page=1
           while :; do
             resp=$(curl -sSf \
@@ -88,10 +94,14 @@ jobs:
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}")
             count=$(echo "$resp" | jq -r 'length')
             if [ "$count" -eq 0 ]; then break; fi
-            echo "$resp" | jq -r '.[].tag_name' >> "$local_tags_file"
+            echo "$resp" | jq -c '.[] | {tag: .tag_name, assets: [.assets[].name]}' >> "$rel_file"
             page=$((page + 1))
           done
-          sort -u "$local_tags_file" -o "$local_tags_file" 2>/dev/null || true
+
+          has_asset() {  # has_asset <tag> <suffix>
+            grep -F "\"tag\":\"$1\"" "$rel_file" 2>/dev/null \
+              | jq -r --arg s "$2" '.assets[] | select(endswith($s))' 2>/dev/null | grep -q . 
+          }
 
           # ---- 2. 获取 aseprite/aseprite 官方 tags（分页拉取）----
           official_tags_file="$(mktemp)"
@@ -113,32 +123,39 @@ jobs:
             if [ "$(printf '%s\n%s\n' "${MIN_VERSION}" "$tag" | sort -V | head -n 1)" = "${MIN_VERSION}" ]; then
               echo "$tag"
             fi
-          done > "$stable_file" || true
-          sort -u "$stable_file" -o "$stable_file"
+          done | sort -rV > "$stable_file" || true
           echo "目标范围内的官方版本（>= ${MIN_VERSION}）："
           cat "$stable_file" || true
-          echo "本仓库已有 releases（含 draft）："
-          cat "$local_tags_file" || true
+          echo "本仓库已有 releases："
+          cat "$rel_file" || true
 
-          # ---- 4. 对比找出缺失版本（最新在前）----
-          missing="$(comm -23 "$stable_file" "$local_tags_file" | sort -rV)"
-          echo "缺失版本："
-          echo "$missing" || true
+          # ---- 4. 按「版本×平台」计算缺失组合 ----
+          combos_json="["
+          first=1
+          while read -r tag; do
+            [ -z "$tag" ] && continue
+            for plat in windows-latest macos-latest ubuntu-latest; do
+              case "$plat" in
+                windows-latest) suffix="-windows-x64.zip" ;;
+                macos-latest)   suffix="-macos-arm64.zip" ;;
+                ubuntu-latest)  suffix="-linux-x64.tar.gz" ;;
+              esac
+              if ! has_asset "$tag" "$suffix"; then
+                echo "缺失：${tag} × ${plat}"
+                if [ $first -eq 1 ]; then first=0; else combos_json="${combos_json},"; fi
+                combos_json="${combos_json}{\"version\":\"${tag}\",\"platform\":\"${plat}\"}"
+              fi
+            done
+          done < "$stable_file"
+          combos_json="${combos_json}]"
 
-          # ---- 5. 输出为 JSON 数组 ----
-          if [ -z "$(echo "$missing" | tr -d '[:space:]')" ]; then
-            json="[]"
-          else
-            json=$(echo "$missing" | jq -R . | jq -s -c .)
-          fi
-          echo "missing_versions=${json}" >> "$GITHUB_OUTPUT"
-          echo "最终输出：${json}"
+          echo "missing_combos=${combos_json}" >> "$GITHUB_OUTPUT"
+          echo "最终输出：${combos_json}"
 
   # ---------------------------------------------------------------------------
   # Job 2：构建矩阵
-  #  - workflow_dispatch（未勾选 build_all）：version 取输入（空则解析为最新稳定
-  #    版），platform 取用户选择，单组合。
-  #  - schedule 或 build_all：version 取缺失版本数组，platform 为三个平台。
+  #  - workflow_dispatch（未勾选 build_all）：单个「版本×平台」组合。
+  #  - schedule 或 build_all：全部缺失的「版本×平台」组合。
   # ---------------------------------------------------------------------------
   build:
     needs: check-and-trigger
@@ -149,19 +166,16 @@ jobs:
         (
           (github.event_name == 'schedule' || inputs.build_all == true) &&
           needs.check-and-trigger.result == 'success' &&
-          needs.check-and-trigger.outputs.missing_versions != '' &&
-          needs.check-and-trigger.outputs.missing_versions != '[]'
+          needs.check-and-trigger.outputs.missing_combos != '' &&
+          needs.check-and-trigger.outputs.missing_combos != '[]'
         )
       )
     strategy:
       fail-fast: false
       matrix:
-        version: ${{ (github.event_name == 'workflow_dispatch' && inputs.build_all != true)
-          && fromJSON(format('["{0}"]', inputs.aseprite_version))
-          || fromJSON(needs.check-and-trigger.outputs.missing_versions) }}
-        platform: ${{ (github.event_name == 'workflow_dispatch' && inputs.build_all != true)
-          && fromJSON(format('["{0}"]', inputs.platform))
-          || fromJSON('["windows-latest", "macos-latest", "ubuntu-latest"]') }}
+        include: ${{ (github.event_name == 'workflow_dispatch' && inputs.build_all != true)
+          && fromJSON(format('[{{"version": "{0}", "platform": "{1}"}}]', inputs.aseprite_version, inputs.platform))
+          || fromJSON(needs.check-and-trigger.outputs.missing_combos) }}
     runs-on: ${{ matrix.platform }}
     defaults:
       run:
@@ -346,8 +360,10 @@ jobs:
           if-no-files-found: error
 
       # -----------------------------------------------------------------
-      # 发布 Draft Release
-      # 若同名 release（含草稿）已存在则先删除，再创建草稿并上传产物
+      # 发布 Draft Release（并发安全）
+      #  - 已存在的草稿不删除，产物用 --clobber 覆盖上传（始终为最新构建）；
+      #  - 同一版本的三个平台任务并发运行时互不干扰；
+      #  - 仅当同名 Release 已被发布为正式版时，先删除（含 tag）再重建为草稿。
       # -----------------------------------------------------------------
       - name: 发布 Draft Release
         env:
@@ -356,21 +372,40 @@ jobs:
           ARTIFACT: ${{ env.artifact_name }}
         run: |
           set -euo pipefail
-          # 若同名 release（无论草稿还是正式）已存在，先删除
-          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "已存在同名 release：${VERSION}，先删除"
-            gh release delete "$VERSION" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || {
-              echo "gh release delete 失败，尝试手动删除 tag"
-              git push --delete "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$VERSION" || true
-            }
+          # 若同名 release 已存在且为正式发布（非草稿），先删除再重建为草稿
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft >/dev/null 2>&1; then
+            is_draft=$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)
+            if [ "$is_draft" != "true" ]; then
+              echo "已存在正式 release：${VERSION}，删除后重建为草稿"
+              gh release delete "$VERSION" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || {
+                echo "gh release delete 失败，尝试手动删除 tag"
+                git push --delete "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$VERSION" || true
+              }
+            fi
           fi
-          # 创建草稿 release
-          gh release create "$VERSION" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Aseprite ${VERSION} (Auto Build)" \
-            --draft \
-            --notes "自动构建于 $(date -u)"
-          # 上传所有匹配的产物
-          gh release upload "$VERSION" build/aseprite-"${VERSION}"-* \
-            --repo "$GITHUB_REPOSITORY" --clobber
-          echo "已上传产物到 Draft Release：${VERSION}"
+          # 若草稿不存在则创建（并发下可能已被兄弟任务创建，失败可容忍）
+          if ! gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Aseprite ${VERSION} (Auto Build)" \
+              --draft \
+              --notes "自动构建于 $(date -u)" \
+              || echo "release ${VERSION} 创建失败（可能已被并行任务创建），继续上传"
+          fi
+          # 等待 release 可见（API 最终一致性）
+          for i in $(seq 1 12); do
+            gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && break
+            sleep 5
+          done
+          # 上传产物（--clobber 覆盖同名旧产物；带重试，缓解瞬时 403/限流）
+          for attempt in 1 2 3; do
+            if gh release upload "$VERSION" "build/${ARTIFACT}" \
+                 --repo "$GITHUB_REPOSITORY" --clobber; then
+              echo "已上传产物到 Draft Release：${VERSION}（${ARTIFACT}）"
+              exit 0
+            fi
+            echo "上传失败（第 ${attempt} 次），10 秒后重试"
+            sleep 10
+          done
+          echo "产物上传最终失败：${ARTIFACT}"
+          exit 1
